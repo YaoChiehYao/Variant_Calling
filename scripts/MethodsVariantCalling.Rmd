@@ -1,0 +1,203 @@
+---
+title: "MethodsVariantCalling.Rmd"
+author: "Yaochieh Yao"
+date: "2/20/2023"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+bibliography: bibliography.ris
+---
+
+## Title
+In this assignment 5, we use the genome analysis tool kit(GATK) workflow, 
+a standard industrial toolkit [@McKenna] designed for the whole human genome 
+and exome data. The process includes NGS data processing, genotyping and 
+variant discovery, and variant filtering and evaluation. In the variant 
+discovery process, we use DeepVariant [@Poplin], using the convolutional 
+neural network (CNN) learning method to train AI for variants calling and 
+generating "vcf" and "gvcf" files for further filter & annotation, which 
+is not covered in this assignment. 
+
+
+## Method  
+We use a tool called Trimmomatic [@Chen] for quality trimming the raw 
+sequence data to avoid adapter sequences, and low-quality reads for the NGS 
+data processing. After that, we download the reference genome from EBI and 
+use the Burrows-Wheeler Aligner (BWA) mem method [@Li], a recommended latest 
+version for a better quality alignment for the reads with reference, and 
+generate a bam file. Finally, we apply DeepVariant [@Poplin] for variant 
+calling using Docker. 
+
+
+#### getGenome.sh
+This getGenome.sh scripts get the human genome file of GRCh38 from FTP server 
+of European Bioinformatics Institute (EBI), and provide reference genome for 
+the sequence alignment. 
+
+```
+#!/usr/bin/env bash
+# getGenome.sh
+
+# Get the GRCh38 reference genome
+wget -c ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_27/GRCh38.primary_assembly.genome.fa.gz \
+    -O GRCh38_reference.fa.gz \
+    1>getGenome.log 2>getGenome.err &
+```
+
+
+
+#### getReads.sh
+This getReads.sh scripts retrieve the NGS data from the NA12878 reference 
+sample by NCBI’s fast-dump toolkit to manipulate SRA files, and splitting 
+the file for data formatting.
+
+```
+#!/usr/bin/env bash
+# getReads.sh
+
+# Retrieve the NGS reads from the NA12878 reference sample
+fastq-dump --split-files SRR6808334 1>getReads.log 2>getReads.err &
+```
+
+
+
+#### trimReads.sh
+This trimReads.sh scripts use Trimmomatic [@Chen], in our case, use pair-end 
+(PE) sequence data to trim FASTQ files, remove adaptors, and filter data for 
+alignment. The parameters are explained as follows:
+  
+  - The PE and SE parameter indicates the FASTQ data is pair-end or single-end. 
+  - The phred 33 / phred 64 are the quality score converter 
+  - The threads show how many server threads for running in this job
+  - HEADCROP indicates how many bases should be removed from the beginning of 
+    the sequence (trim the primer/ adaptor)
+  - ILLUMINACLIP cuts adaptor and other Illumina-specified sequences from the 
+    read
+  - LEADING and TRAILING tells the algorithm where to cut the base off
+  - SLIDINGWINSODE performs a sliding window trimming approach. It starts 
+    scanning from the 5' end and clips the reads once the average quality within 
+    the window falls below a threshold
+  - MINLEN drops the minimum reads if it is less than a specified length
+   
+```
+#!/usr/bin/env bash
+# trimReads.sh
+nice -n 19 java -jar /usr/local/programs/Trimmomatic-0.36/trimmomatic-0.36.jar PE \
+    -threads 1 -phred33 \
+    SRR6808334_1.fastq \
+    SRR6808334_2.fastq \
+    SRR6808334_1.paired.fastq \
+    SRR6808334_1.unpaired.fastq \
+    SRR6808334_2.paired.fastq \
+    SRR6808334_2.unpaired.fastq \
+    HEADCROP:0 \
+    ILLUMINACLIP:/usr/local/programs/Trimmomatic-0.36/adapters/TruSeq3-PE.fa:2:30:10 \
+    LEADING:20 TRAILING:20 SLIDINGWINDOW:4:30 MINLEN:36 \
+    1>trimReads.log 2>trimReads.err &
+```
+
+
+
+#### alignReads.sh
+This alignReads.sh script uses the Burrows-Wheeler Aligner (BWA) mem method 
+[@Li] to align pair-end reads into a SAM file. Its parameters are explained 
+as follows:
+
+- t (INT) means the number of threads
+- R (STR) is for formatting the complete read group header line. 
+          ’\t’ can be used in STR  and will be converted to a TAB in the output 
+          SAM. The read group ID will be attached to every read in the output. 
+          An example is ’@RG\tID:foo\tSM:bar’.
+- p means paired-end mode.
+
+```
+#!/usr/bin/env bash
+# alignReads.sh
+bwa mem -t 8 -R "@RG\tID:SRR6808334\tSM:bar" -p GRCh38_reference.fa SRR6808334_1.fastq SRR6808334_2.fastq \
+    1>SRR6808334.sam 2>alignReads.err &
+```
+
+#### runDeepVariant.sh
+The last script runDeepVariant.sh uses DeepVariant [@Poplin] for variant 
+calling using Docker for SW dependency. The following code uses using CPU 
+version. Please refer to their GitHub page for more information:
+https://github.com/google/deepvariant
+
+```
+#!/usr/bin/env bash
+# runDeepVariant.sh
+
+
+set -euo pipefail
+
+BASE="/mnt/disks/sdb/binf6309-julianstanley/VariantCalling"
+BIN_VERSION="0.8.0"
+
+INPUT_DIR="${BASE}/input/data"
+REF="GRCh38_reference.fa.gz"
+BAM="SRR6808334.bam.sorted"
+
+N_SHARDS="64"
+
+OUTPUT_DIR="${BASE}/output"
+OUTPUT_VCF="SRR6808334.output.vcf.gz"
+OUTPUT_GVCF="SRR6808334.output.vcf.gz"
+LOG_DIR="${OUTPUT_DIR}/logs"
+
+## Create directory structure
+mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${INPUT_DIR}"
+mkdir -p "${LOG_DIR}"
+
+## Downloads
+sudo apt-get -qq -y update
+
+if ! hash docker 2>/dev/null; then
+      echo "'docker' was not found in PATH. Installing docker..."
+      # Install docker using instructions on:
+      # https://docs.docker.com/install/linux/docker-ce/ubuntu/
+      sudo apt-get -qq -y install \
+          apt-transport-https \
+          ca-certificates \
+          curl \
+          gnupg-agent \
+          software-properties-common
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+      sudo add-apt-repository \
+          "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+          $(lsb_release -cs) \
+          stable"
+      sudo apt-get -qq -y update
+      sudo apt-get -qq -y install docker-ce
+fi
+
+# Copy the data
+echo "Copying data"
+cp SRR6808334.bam.sorted -d "${INPUT_DIR}"
+cp SRR6808334.bai -d "${INPUT_DIR}"
+cp GRCh38_reference.fa.gz -d "${INPUT_DIR}"
+cp GRCh38_reference.fa.gz.gzi -d "${INPUT_DIR}"
+cp GRCh38_reference.fa.gz.fai -d "${INPUT_DIR}"
+
+## Pull the docker image.
+sudo docker pull gcr.io/deepvariant-docker/deepvariant:"${BIN_VERSION}"
+
+echo "Running DeepVariant..."
+sudo docker run \
+      -v "${INPUT_DIR}":"/input" \
+      -v "${OUTPUT_DIR}:/output" \
+      gcr.io/deepvariant-docker/deepvariant:"${BIN_VERSION}" \
+      /opt/deepvariant/bin/run_deepvariant \
+      --model_type=WGS \
+      --ref="/input/${REF}" \
+      --reads="/input/${BAM}" \
+      --output_vcf=/output/${OUTPUT_VCF} \
+      --output_gvcf=/output/${OUTPUT_GVCF} \
+      --num_shards=${N_SHARDS}
+echo "Done."
+echo
+```
+
+## Reference  
