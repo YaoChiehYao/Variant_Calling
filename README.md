@@ -1,5 +1,6 @@
-##  BINF 6309 Assignment 5 Variant Calling 
-Author: Yao Chieh Yao
+BINF 6309 Assignment 5 
+
+# Project Name: Variant Calling 
 
 
 ## Description
